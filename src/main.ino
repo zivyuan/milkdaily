@@ -5,10 +5,15 @@
 #include <WiFiClient.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPClient.h>
+#include <DHT.h>
+
+// #define ENV_DEVELOPMENT
 
 #define SENSOR_HUMAN 2
 #define SENSOR_LED   15
-#define SENSON_TEMPERATURE 4
+
+#define DHTPIN 0
+#define DHTTYPE DHT22
 
 // Human active continue event gap mark
 #define ACTIVE_CONTINUE_GAP 10000
@@ -23,11 +28,12 @@ void setup(void){
   pinMode(led, OUTPUT);
   pinMode(SENSOR_HUMAN, INPUT);
   pinMode(SENSOR_LED, OUTPUT);
+  pinMode(DHTPIN, INPUT);
 
   digitalWrite(led, LOW);
   Serial.begin(115200);
   while (!Serial);
-  
+
   Serial.print("connecting ");
 
   WiFiMulti.addAP("gem", "6.Z:)Kjb4yvc");
@@ -45,42 +51,80 @@ void setup(void){
   Serial.print("Connected to ");
   Serial.println(WiFi.SSID());
   Serial.print("IP address: ");
-  Serial.println( WiFi.localIP() );
+  Serial.println( String(WiFi.localIP()) );
 
   if (MDNS.begin("esp8266")) {
     Serial.println("MDNS responder started");
   }
 
-  delay(200);
 
   logStatus("Milk Watcher Start");
 }
 
+void loop(void){
+
+	handleToiletActive();
+
+	// handleTemperature();
+
+}
+
+void reportToThingSpeak(String query) {
+  HTTPClient http;
+
+  http.begin("http://api.thingspeak.com/update?api_key=5CPEV0RT47HZN8DS&" + query);
+  http.GET();
+  http.end();
+}
+
+
+// ======
+void logStatus(String status) {
+
+  HTTPClient http;
+
+  status.replace(" ", "%20");
+
+  http.begin("http://www.gemdesign.cn/arduino/log.php?mark=" + status);
+  http.GET();
+  http.end();
+
+}
+
+void reportToiletActive() {
+  reportToThingSpeak("field1=1");
+}
+
+void reportToiletDuration(int duration) {
+  reportToThingSpeak("field2=" + String(duration / 1000));
+}
+
+
+//
+//  == Toilet event handle
+//
 int detector_active = 0;   // 传感器状态
 int living_active = 0;     // 生物活动状态
 int living_deactive_measure = 0;
+int living_active_time = 0;
 
-void loop(void){
+void handleToiletActive() {
 
   int _ht = digitalRead(SENSOR_HUMAN);
 
   if (_ht == 0 && detector_active == 1) {
     detector_active = 0;
-    // Serial.println("Deactive: " + String(millis()));
-    logStatus("Deactive: " + String(millis()));
-    digitalWrite(SENSOR_LED, LOW);
   } else if (_ht == 1 && detector_active == 0) {
     detector_active = 1;
-    // Serial.println("__Active: " + String(millis()));
-    logStatus("__Active: " + String(millis()));
-    digitalWrite(SENSOR_LED, HIGH);
   }
 
   if (detector_active == 1 && living_active == 0) {
     living_active = 1;
     living_deactive_measure = 0;
+    living_active_time = millis();
     // Log living beings status as Active
-    logStatus(":: __Active");
+    reportToiletActive();
+    logStatus("+: __Active");
 
   } else if (detector_active == 1 && living_active == 1) {
     if (living_deactive_measure > 0) {
@@ -97,7 +141,8 @@ void loop(void){
         living_active = 0;
         living_deactive_measure = 0;
         // Log living beings status as Deactive
-        logStatus(":: Deactive");
+        reportToiletDuration(millis() - living_active_time);
+        logStatus("+: Deactive");
       }
     }
 
@@ -105,15 +150,60 @@ void loop(void){
     // detector_active == 0 && living_active == 0
     // No action needed
   }
+}
+
+//
+// == Toilet event handle END
+//
+
+
+//
+// Temperature Detect
+//
+DHT dht(DHTPIN, DHTTYPE);
+int dht_report_time = 0;
+#define DHT_REPORT_INTERVAL    30000      // 温度上报间隔
+
+void handleTemperature() {
+
+	int interval = millis() - dht_report_time;
+	if (interval < DHT_REPORT_INTERVAL)
+	{
+		return;
+	}
+
+  Serial.println("Meaure temperature and humidity...");
+	float h = dht.readHumidity();
+	float t = dht.readTemperature();
+
+	if (isnan(h) || isnan(t))
+	{
+		Serial.println("Failed to read form DHT sensor!");
+    logStatus("Temperature test Failed");
+	} else {
+		// humidity = h;
+		// temperature = t;
+		Serial.println("DHT Humidity: " + String(h));
+		Serial.println("DHT Temperature: " + String(t));
+
+    logStatus("H: " + String(h) + ", T: " + String(t));
+		reportDHTData(h, t);
+	}
+
+	dht_report_time = millis();
 
 }
 
-// ======
-void logStatus(String status) {
-  HTTPClient http;
+void reportDHTData(int h, int t) {
 
-  status.replace(" ", "%20");
-  http.begin("http://www.gemdesign.cn/arduino/log.php?mark=" + status);
-  http.GET();
-  http.end();
+	HTTPClient http;
+
+	String query = "?api_key=5CPEV0RT47HZN8DS";
+	query = "&" + query + "field4=" + String(h);
+	query = "&" + query + "field3=" + String(t);
+
+	http.begin("http://api.thingspeak.com/update" + query);
+	http.GET();
+	http.end();
+
 }
