@@ -5,47 +5,91 @@
 #include <WiFiClient.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPClient.h>
-#include <DHT.h>
 
 // #define ENV_DEVELOPMENT
 
-#define SENSOR_HUMAN 2
-#define SENSOR_LED   15
+#define API_BASE     String("http://gemdesign.cn/milk/dailylog.php")
+// 心跳频率 10 分钟
+#define HEART_RATE   600000
 
-#define DHTPIN 0
-#define DHTTYPE DHT22
+#define LED          2
+#define DOOR_TOP     16
+#define DOOR_BOTTOM  14
 
-// Human active continue event gap mark
-#define ACTIVE_CONTINUE_GAP 10000
+#define OPEN       0
+#define CLOSE      1
+
+
+void debug(String query) {
+  HTTPClient http;
+
+  query.replace(" ", "%20");
+
+  http.begin("http://192.168.31.243/arduino/?v=" + query);
+  http.GET();
+  http.end();
+}
+
+// void reportThingsSpeak(String query) {
+//   query.replace(" ", "%20");
+//
+//   http.begin("https://api.thingspeak.com/update?api_key=5CPEV0RT47HZN8DS&" + query);
+//   http.GET();
+//   http.end();
+// }
+
+void reportLog(String event, String data = "") {
+  HTTPClient http;
+
+  // String api = String(API_BASE + "?e=");
+
+  event.replace(" ", "%20");
+  data.replace(" ", "%20");
+
+  // api = String(api + event);
+  // api = String(api + "&d=");
+  // api = String(api + data);
+  http.begin(API_BASE + "?e=" + event + "&d=" + data);
+  http.GET();
+  http.end();
+
+}
+
+
+// =============================================================================
 
 ESP8266WiFiMulti WiFiMulti;
 
-const int led = 13;
-
-int blink_state = 0;
+int ledOn = 0;
 
 void setup(void){
-  pinMode(led, OUTPUT);
-  pinMode(SENSOR_HUMAN, INPUT);
-  pinMode(SENSOR_LED, OUTPUT);
-  pinMode(DHTPIN, INPUT);
+  pinMode(LED, OUTPUT);
 
-  digitalWrite(led, LOW);
+  pinMode(DOOR_TOP, INPUT);
+  pinMode(DOOR_BOTTOM, INPUT);
+
+  digitalWrite(LED, LOW);
+
   Serial.begin(115200);
-  while (!Serial);
+
+  while(!Serial) {
+    ;
+  }
 
   Serial.print("connecting ");
 
-  WiFiMulti.addAP("gem", "6.Z:)Kjb4yvc");
   WiFiMulti.addAP("Gozi2016", "pass4share");
 
   // Wait for connection
   while ((WiFiMulti.run() != WL_CONNECTED)) {
     delay(500);
-    blink_state = blink_state == 0 ? 1 : 0;
-    digitalWrite(led, blink_state);
+    ledOn = ledOn == 0 ? 1 : 0;
+    digitalWrite(LED, ledOn);
     Serial.print(".");
   }
+
+  debug("WIFI connect success");
+  debug(String(WiFi.localIP()));
 
   Serial.println("");
   Serial.print("Connected to ");
@@ -57,153 +101,107 @@ void setup(void){
     Serial.println("MDNS responder started");
   }
 
-
-  logStatus("Milk Watcher Start");
+  reportLog("Milk Watcher Ready");
 }
+
+int topAct = OPEN;  // Top sensor default state
+int topActKeep = 0;
+int botAct = CLOSE; // Bottom sensor default state
+unsigned long  botSensitivity = 700;
+unsigned long botActTime = 0;
+unsigned long shittingTime = 0;       // Milk state. 0, out; 1, push door in; 2, in toilet; 3, push door out
+int ledCount = 1000;
+int door = CLOSE;
+int milkShitting = 0;
+unsigned long heartRate = millis();
 
 void loop(void){
 
-	handleToiletActive();
+  if (milkShitting == 1) {
+    if (ledCount == 0) {
+      if (ledOn) {
+        digitalWrite(LED, LOW);
+        ledOn = 0;
 
-	// handleTemperature();
+      } else {
+        digitalWrite(LED, HIGH);
+        ledOn = 1;
+      }
+      ledCount = 200;
 
-}
-
-void reportToThingSpeak(String query) {
-  HTTPClient http;
-
-  http.begin("http://api.thingspeak.com/update?api_key=5CPEV0RT47HZN8DS&" + query);
-  http.GET();
-  http.end();
-}
-
-
-// ======
-void logStatus(String status) {
-
-  HTTPClient http;
-
-  status.replace(" ", "%20");
-
-  http.begin("http://www.gemdesign.cn/arduino/log.php?mark=" + status);
-  http.GET();
-  http.end();
-
-}
-
-void reportToiletActive() {
-  reportToThingSpeak("field1=1");
-}
-
-void reportToiletDuration(int duration) {
-  reportToThingSpeak("field2=" + String(duration / 1000));
-}
-
-
-//
-//  == Toilet event handle
-//
-int detector_active = 0;   // 传感器状态
-int living_active = 0;     // 生物活动状态
-int living_deactive_measure = 0;
-int living_active_time = 0;
-
-void handleToiletActive() {
-
-  int _ht = digitalRead(SENSOR_HUMAN);
-
-  if (_ht == 0 && detector_active == 1) {
-    detector_active = 0;
-  } else if (_ht == 1 && detector_active == 0) {
-    detector_active = 1;
+    } else {
+      ledCount --;
+    }
   }
 
-  if (detector_active == 1 && living_active == 0) {
-    living_active = 1;
-    living_deactive_measure = 0;
-    living_active_time = millis();
-    // Log living beings status as Active
-    reportToiletActive();
-    logStatus("+: __Active");
+  int top = digitalRead(DOOR_TOP);
+  if (top != topAct) {
+    if (top == 1 && topActKeep != 1 && door == OPEN) {
+      // debug("open direction in");
+      topActKeep = 1;
+    }
+    topAct = top;
+  }
 
-  } else if (detector_active == 1 && living_active == 1) {
-    if (living_deactive_measure > 0) {
-      living_deactive_measure = 0;
+  int bot = digitalRead(DOOR_BOTTOM);
+  if (bot != botAct) {
+    if (bot == 0 && door == CLOSE) {
+      // 门运动开始
+      door = OPEN;
+      botAct = bot;
+      // debug("door open");
+      reportLog("Door Open", "");
+      // digitalWrite(LED, HIGH);
+
+    } else if (bot == 1 && door == OPEN) {
+      botActTime = millis();
     }
 
-  } else if (detector_active == 0 && living_active == 1) {
-    // Living beings' active may stoped
-    if (living_deactive_measure == 0) {
-      living_deactive_measure = millis();
-    } else {
-      int _time = millis();
-      if ((_time - living_deactive_measure) > ACTIVE_CONTINUE_GAP) {
-        living_active = 0;
-        living_deactive_measure = 0;
-        // Log living beings status as Deactive
-        reportToiletDuration(millis() - living_active_time);
-        logStatus("+: Deactive");
-      }
-    }
+    botAct = bot;
 
   } else {
-    // detector_active == 0 && living_active == 0
-    // No action needed
+    if (bot == 1 && door == OPEN) {
+      // debug("door swing...");
+      // 门回落
+      unsigned long tt = millis();
+      unsigned long distance = tt - botActTime;
+      if (distance > botSensitivity) {
+        door = CLOSE;
+        // debug("door fall back");
+        reportLog("Door Close", "");
+        // digitalWrite(LED, LOW);
+
+        if (milkShitting == 1) {
+          milkShitting = 0;
+          topActKeep = 0;
+          shittingTime = millis() - shittingTime;
+          shittingTime = shittingTime / 1000;
+          digitalWrite(LED, HIGH);
+          // debug("shitting end!");
+          reportLog("Shit End", String(shittingTime));
+          shittingTime = 0;
+        }
+
+        if (topActKeep == 1) {
+          // Milk shitting
+          milkShitting = 1;
+          topActKeep = 0;
+          shittingTime = millis();
+          // debug("ready shitting...");
+          reportLog("Shit Start", "");
+        }
+
+      }
+    }
   }
-}
 
-//
-// == Toilet event handle END
-//
+  // Serial.print('.');
 
+  unsigned long hd = millis() - heartRate;
+  if (hd > HEART_RATE) {
+    heartRate = millis();
+    reportLog("HEART RATE");
+  }
 
-//
-// Temperature Detect
-//
-DHT dht(DHTPIN, DHTTYPE);
-int dht_report_time = 0;
-#define DHT_REPORT_INTERVAL    30000      // 温度上报间隔
-
-void handleTemperature() {
-
-	int interval = millis() - dht_report_time;
-	if (interval < DHT_REPORT_INTERVAL)
-	{
-		return;
-	}
-
-  Serial.println("Meaure temperature and humidity...");
-	float h = dht.readHumidity();
-	float t = dht.readTemperature();
-
-	if (isnan(h) || isnan(t))
-	{
-		Serial.println("Failed to read form DHT sensor!");
-    logStatus("Temperature test Failed");
-	} else {
-		// humidity = h;
-		// temperature = t;
-		Serial.println("DHT Humidity: " + String(h));
-		Serial.println("DHT Temperature: " + String(t));
-
-    logStatus("H: " + String(h) + ", T: " + String(t));
-		reportDHTData(h, t);
-	}
-
-	dht_report_time = millis();
-
-}
-
-void reportDHTData(int h, int t) {
-
-	HTTPClient http;
-
-	String query = "?api_key=5CPEV0RT47HZN8DS";
-	query = "&" + query + "field4=" + String(h);
-	query = "&" + query + "field3=" + String(t);
-
-	http.begin("http://api.thingspeak.com/update" + query);
-	http.GET();
-	http.end();
-
+  delay(1);
 }
