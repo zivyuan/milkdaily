@@ -6,9 +6,16 @@
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPClient.h>
 
-// #define ENV_DEVELOPMENT
+// Development config
+// 本地网络调试
+// #define LOCAL_DEBUG   1
+// 是否记录日志
+// #define NO_REPORT     1
+
 
 #define API_BASE     String("http://gemdesign.cn/milk/dailylog.php")
+#define AP_NAME       "Gozi2016"
+#define PASSWORD      "pass4share"
 // 心跳频率 10 分钟
 #define HEART_RATE   600000
 
@@ -16,11 +23,36 @@
 #define DOOR_TOP     16
 #define DOOR_BOTTOM  14
 
-#define OPEN       0
-#define CLOSE      1
+#define CLOSED        1
+#define OPEN          0
+
+#define ATTACHED       1
+#define DETACHED       0
+
+// 门磁感激活超过指定时间后判定为门完全关闭. Default value: 800ms
+#define FLAG_DOOR_CLOSE_TIMER    800
+// 顶部磁感激活超过指定时间后判定为维护状态. Default value: 9000ms
+#define FLAG_TOP_ATTACH_TIMER    9000
+// 使用超时. 兼容设置, 如果一次使用时间超过5分钟则自动标记为停止使用
+#define FLAG_USING_OVERTIME      300000
 
 
-void debug(String query) {
+#define IDLE            0
+#define USING           1
+#define MAINTAIN        2
+#define UNCERTAIN       3
+
+#define UNLOCK          0
+#define LOCK            1
+
+
+#ifndef LOCAL_DEBUG
+
+#define debug(message)    // http_debug(message)  // Code ignored
+
+#else
+
+void http_debug(String query) {
   HTTPClient http;
 
   query.replace(" ", "%20");
@@ -30,37 +62,59 @@ void debug(String query) {
   http.end();
 }
 
-// void reportThingsSpeak(String query) {
-//   query.replace(" ", "%20");
-//
-//   http.begin("https://api.thingspeak.com/update?api_key=5CPEV0RT47HZN8DS&" + query);
-//   http.GET();
-//   http.end();
-// }
+#define debug(message)    http_debug(message)
 
-void reportLog(String event, String data = "") {
-  HTTPClient http;
-
-  // String api = String(API_BASE + "?e=");
-
-  event.replace(" ", "%20");
-  data.replace(" ", "%20");
-
-  // api = String(api + event);
-  // api = String(api + "&d=");
-  // api = String(api + data);
-  http.begin(API_BASE + "?e=" + event + "&d=" + data);
-  http.GET();
-  http.end();
-
-}
-
+#endif
 
 // =============================================================================
 
 ESP8266WiFiMulti WiFiMulti;
 
-int ledOn = 0;
+int ledState = LOW;
+unsigned long ledTimer = 0;
+String ID = "";
+int topAct = DETACHED;  // Top sensor default state
+int botAct = CLOSED; // Bottom sensor default state
+unsigned long botCloseTimer = 0;
+unsigned long topAttachTimer = 0;
+int toiletState = IDLE;
+int toiletUsingLock = UNLOCK;
+unsigned long toiletUsingStart = 0;
+int doorState = CLOSED;
+
+unsigned long heartRate = millis();
+
+
+/**
+ * Convert IP from int
+ */
+String ipFromInt(unsigned int ip) {
+    unsigned int a = int( ip / 16777216 );
+    unsigned int b = int( (ip % 16777216) / 65536 );
+    unsigned int c = int( ((ip % 16777216) % 65536) / 256 );
+    unsigned int d = int( ((ip % 16777216) % 65536) % 256 );
+    String ipstr = String(d) + '.' + String(c) + '.' + String(b) + '.' + String(a);
+
+    return ipstr;
+}
+
+// Data report handle
+void report(String event, String data = "") {
+#ifndef NO_REPORT
+
+  HTTPClient http;
+
+  event.replace(" ", "%20");
+  data.replace(" ", "%20");
+
+  String request = API_BASE + "?id=" + ID + "&e=" + event + "&d=" + data;
+
+  http.begin(request);
+  http.GET();
+  http.end();
+
+#endif
+}
 
 void setup(void){
   pinMode(LED, OUTPUT);
@@ -78,9 +132,10 @@ void setup(void){
 
   Serial.print("connecting ");
 
-  WiFiMulti.addAP("Gozi2016", "pass4share");
+  WiFiMulti.addAP(AP_NAME, PASSWORD);
 
   // Wait for connection
+  int ledOn = 0;
   while ((WiFiMulti.run() != WL_CONNECTED)) {
     delay(500);
     ledOn = ledOn == 0 ? 1 : 0;
@@ -88,120 +143,163 @@ void setup(void){
     Serial.print(".");
   }
 
+  ID = WiFi.macAddress();
+  debug(" ");
   debug("WIFI connect success");
-  debug(String(WiFi.localIP()));
+  debug(ipFromInt(WiFi.localIP()));
+  debug(ID);
 
   Serial.println("");
   Serial.print("Connected to ");
   Serial.println(WiFi.SSID());
   Serial.print("IP address: ");
-  Serial.println( String(WiFi.localIP()) );
+  Serial.println( ipFromInt(WiFi.localIP()) );
+  //
+  // if (MDNS.begin("esp8266")) {
+  //   Serial.println("MDNS responder started");
+  // }
 
-  if (MDNS.begin("esp8266")) {
-    Serial.println("MDNS responder started");
-  }
+  report("Watch dog " + ID + " report!");
 
-  reportLog("Milk Watcher Ready");
+  topAct = digitalRead(DOOR_TOP);
+  botAct = digitalRead(DOOR_BOTTOM);
+  doorState = botAct == OPEN ? OPEN : CLOSED;
 }
 
-int topAct = OPEN;  // Top sensor default state
-int topActKeep = 0;
-int botAct = CLOSE; // Bottom sensor default state
-unsigned long  botSensitivity = 700;
-unsigned long botActTime = 0;
-unsigned long shittingTime = 0;       // Milk state. 0, out; 1, push door in; 2, in toilet; 3, push door out
-int ledCount = 1000;
-int door = CLOSE;
-int milkShitting = 0;
-unsigned long heartRate = millis();
-
 void loop(void){
+  int top = digitalRead(DOOR_TOP);
+  int bot = digitalRead(DOOR_BOTTOM);
 
-  if (milkShitting == 1) {
-    if (ledCount == 0) {
-      if (ledOn) {
-        digitalWrite(LED, LOW);
-        ledOn = 0;
 
-      } else {
-        digitalWrite(LED, HIGH);
-        ledOn = 1;
-      }
-      ledCount = 200;
+  unsigned long elapse;
+
+  // !! Door state control block START !!
+  if (bot != botAct) {
+    debug("B: " + String(bot));
+
+    if (bot == CLOSED) {
+      botCloseTimer = millis();
 
     } else {
-      ledCount --;
-    }
-  }
-
-  int top = digitalRead(DOOR_TOP);
-  if (top != topAct) {
-    if (top == 1 && topActKeep != 1 && door == OPEN) {
-      // debug("open direction in");
-      topActKeep = 1;
-    }
-    topAct = top;
-  }
-
-  int bot = digitalRead(DOOR_BOTTOM);
-  if (bot != botAct) {
-    if (bot == 0 && door == CLOSE) {
-      // 门运动开始
-      door = OPEN;
-      botAct = bot;
-      // debug("door open");
-      reportLog("Door Open", "");
-      // digitalWrite(LED, HIGH);
-
-    } else if (bot == 1 && door == OPEN) {
-      botActTime = millis();
+      botCloseTimer = 0;
+      if (doorState == CLOSED) {
+        doorState = OPEN;
+        toiletUsingLock = UNLOCK;
+        debug("Door open.");
+        report("Door Open");
+      }
     }
 
     botAct = bot;
+  }
 
-  } else {
-    if (bot == 1 && door == OPEN) {
-      // debug("door swing...");
-      // 门回落
-      unsigned long tt = millis();
-      unsigned long distance = tt - botActTime;
-      if (distance > botSensitivity) {
-        door = CLOSE;
-        // debug("door fall back");
-        reportLog("Door Close", "");
-        // digitalWrite(LED, LOW);
+  if (botAct == CLOSED) {
+    elapse = millis() - botCloseTimer;
+    if (elapse > FLAG_DOOR_CLOSE_TIMER && doorState == OPEN) {
+      doorState = CLOSED;
+      debug("Door closed.");
+      report("Door Closed");
+    }
+  }
+  // !! Door state control block END !!
 
-        if (milkShitting == 1) {
-          milkShitting = 0;
-          topActKeep = 0;
-          shittingTime = millis() - shittingTime;
-          shittingTime = shittingTime / 1000;
-          digitalWrite(LED, HIGH);
-          // debug("shitting end!");
-          reportLog("Shit End", String(shittingTime));
-          shittingTime = 0;
-        }
+  if (top != topAct) {
+    debug("T: " + String(top));
+    topAct = top;
+  }
 
-        if (topActKeep == 1) {
-          // Milk shitting
-          milkShitting = 1;
-          topActKeep = 0;
-          shittingTime = millis();
-          // debug("ready shitting...");
-          reportLog("Shit Start", "");
-        }
-
+  if (topAct == ATTACHED && doorState == OPEN) {
+    if (toiletState == IDLE) {
+      topAttachTimer = millis();
+      toiletState = UNCERTAIN;
+      debug("Some body go in toilet...");
+    } else {
+      elapse = millis() - topAttachTimer;
+      if (elapse > FLAG_TOP_ATTACH_TIMER && toiletState == UNCERTAIN) {
+        toiletState = MAINTAIN;
+        toiletUsingStart = millis();
+        debug("Toilet maintain start...");
+        report("Maintain Start");
       }
+    }
+  } else if (topAct == DETACHED ) { // && doorState == OPEN
+    if (toiletState == UNCERTAIN) {
+      toiletState = USING;
+      toiletUsingLock = LOCK;
+      toiletUsingStart = millis();
+      debug("Toilet in using...");
+      report("Using Start");
     }
   }
 
-  // Serial.print('.');
+  if (doorState == CLOSED && toiletState == USING) {
+    if (toiletUsingLock == UNLOCK) {
+      toiletState = IDLE;
+      debug("Toilet using complete.");
+      elapse = (millis() - toiletUsingStart) / 1000;
+      report("Using Complete", String(elapse));
+    // } else {
+      // debug("Door close ignore by using.");
+    } else {
+      elapse = millis() - toiletUsingStart;
+      if (elapse > FLAG_USING_OVERTIME) {
+        toiletState = IDLE;
+        debug("Toilet using complete with overtime.");
+        elapse = (millis() - toiletUsingStart) / 1000;
+        report("Using Complete", String(elapse) + ", Overtime");
+      }
+
+    }
+
+  } else if (doorState == CLOSED && toiletState == MAINTAIN) {
+    toiletState = IDLE;
+    debug("Toilet maintain complete.");
+    elapse = (millis() - toiletUsingStart) / 1000;
+    report("Maintain Complete", String(elapse));
+  }
+
+  if (toiletState == UNCERTAIN) {
+    elapse = millis() - ledTimer;
+    if (elapse > 500) {
+      ledTimer = millis();
+      ledState = !ledState;
+      digitalWrite(LED, ledState);
+    }
+
+  } else if (toiletState == USING) {
+    elapse = millis() - ledTimer;
+    if (elapse > 1000) {
+      ledTimer = millis();
+      ledState = !ledState;
+      digitalWrite(LED, ledState);
+    }
+
+  } else if (toiletState == MAINTAIN) {
+    if (ledState == HIGH) {
+      ledState = LOW;
+      digitalWrite(LED, ledState);
+    }
+
+  } else {
+    if (doorState == OPEN) {
+      elapse = millis() - ledTimer;
+      if (elapse > 150) {
+        ledTimer = millis();
+        ledState = !ledState;
+        digitalWrite(LED, ledState);
+      }
+
+    } else if (ledState == LOW) {
+      ledState = HIGH;
+      digitalWrite(LED, HIGH);
+    }
+  }
 
   unsigned long hd = millis() - heartRate;
   if (hd > HEART_RATE) {
-    heartRate = millis();
-    reportLog("HEART RATE");
-  }
+      heartRate = millis();
+      report("HEART RATE");
+    }
 
   delay(1);
 }
