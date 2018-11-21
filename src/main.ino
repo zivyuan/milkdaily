@@ -2,8 +2,6 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WiFiMulti.h>
-#include <WiFiClient.h>
-#include <ESP8266mDNS.h>
 #include <ESP8266HTTPClient.h>
 
 // Development config
@@ -32,7 +30,7 @@
 // 门磁感激活超过指定时间后判定为门完全关闭. Default value: 1000ms
 #define FLAG_DOOR_CLOSE_TIMER    1000
 // 顶部磁感激活超过指定时间后判定为维护状态. Default value: 18000ms
-#define FLAG_TOP_ATTACH_TIMER    18000
+#define FLAG_TOP_ATTACH_TIMER    45000
 // 使用超时. 兼容设置, 如果一次使用时间超过5分钟则自动标记为停止使用
 #define FLAG_USING_OVERTIME      300000
 
